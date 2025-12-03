@@ -1,0 +1,8 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ev-charging-timeseries"
+version = "0.1.0"
+description = "Time series analysis for EV charging using TimescaleDB"
