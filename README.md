@@ -4,7 +4,7 @@ End-to-end passion project for EV charger reliability: synthetic status pings an
 
 ## Quick Start
 ```bash
-# 0) Prereqs: Python 3.9+, Docker (for Timescale)
+# 0) Prereqs: Python 3.13+, Docker (for Timescale)
 python --version
 
 # 1) Activate env and copy config
