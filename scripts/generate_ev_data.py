@@ -103,15 +103,15 @@ SITE_SEED: Sequence[Dict[str, object]] = [
 CONNECTOR_TYPES = ["CCS", "CHAdeMO", "NACS", "Type2"]
 CHARGER_MODELS = ["Delta-50", "ABB-Terra", "ChargePoint-Express", "EVgo-Fast"]
 
-# Tuning knobs for fault patterns and sampling realism
-RANDOM_FAULT_PROB = 0.02  # base chance a non-outage ping is FAULTED
-RANDOM_OFFLINE_PROB = 0.005  # base chance a non-outage ping is OFFLINE
+# Tuning knobs for fault patterns and sampling realism (amped up for demo visibility)
+RANDOM_FAULT_PROB = 0.05  # base chance a non-outage ping is FAULTED
+RANDOM_OFFLINE_PROB = 0.02  # base chance a non-outage ping is OFFLINE
 PING_DROP_PROB = 0.03  # chance to drop a ping entirely
 TIME_JITTER_SECONDS = 20  # jitter timestamps +/- this many seconds
 
 # Daily fault block probabilities (per charger per day)
-DAILY_FAULT_BLOCK_PROB = 0.2  # 30–60 minute FAULTED block
-DAILY_OFFLINE_BLOCK_PROB = 0.12  # 20–45 minute OFFLINE block
+DAILY_FAULT_BLOCK_PROB = 0.6  # 30–60 minute FAULTED block
+DAILY_OFFLINE_BLOCK_PROB = 0.4  # 20–45 minute OFFLINE block
 
 
 def init_schema(engine) -> None:
@@ -183,6 +183,13 @@ def init_schema(engine) -> None:
         conn.execute(text(schema_sql))
 
 
+def reset_data(engine) -> None:
+    """Truncate data tables for a fresh demo run."""
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE charger_status, charging_sessions, chargers, sites RESTART IDENTITY CASCADE;"))
+    print("Reset tables: sites, chargers, charger_status, charging_sessions")
+
+
 def seed_sites(engine) -> List[Dict[str, object]]:
     seeded_sites: List[Dict[str, object]] = []
     with engine.begin() as conn:
@@ -243,7 +250,7 @@ def build_chargers(sites: Sequence[Dict[str, object]], total: int = 50) -> List[
                 "max_power_kw": float(power),
                 "connector_type": random.choice(CONNECTOR_TYPES),
                 "installed_at": now - timedelta(days=random.randint(30, install_window_days)),
-                "fault_multiplier": 3.0 if idx in problem_children else 1.0,
+                "fault_multiplier": 5.0 if idx in problem_children else 1.0,
             }
         )
     return chargers
@@ -535,6 +542,9 @@ def main() -> None:
     engine = create_engine(DATABASE_URL)
     init_schema(engine)
 
+    if args.reset:
+        reset_data(engine)
+
     print("Seeding sites...")
     chosen_sites = pick_sites(SITE_SEED, args.sites)
     # Reuse the seed_sites helper for persistence
@@ -640,6 +650,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chargers", type=int, default=20, help="How many chargers to seed (default: 20)")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--forecast-days", type=int, default=0, help="Forecast horizon (days) to extend sessions into future")
+    parser.add_argument("--reset", action="store_true", help="Truncate tables before seeding (fresh demo)")
     return parser.parse_args()
 
 
