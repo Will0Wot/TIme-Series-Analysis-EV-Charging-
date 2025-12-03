@@ -579,6 +579,41 @@ def main() -> None:
         sessions_by_charger[charger["charger_id"]] = charger_sessions
         all_sessions.extend(charger_sessions)
 
+    # Optional lightweight forecast: extend sessions into the future based on recent patterns.
+    if args.forecast_days > 0:
+        forecast_start = window_end
+        forecast_end = window_end + timedelta(days=args.forecast_days)
+        print(f"Generating forecast sessions for next {args.forecast_days} days...")
+        for charger in chargers:
+            hist = sessions_by_charger.get(charger["charger_id"], [])
+            recent = [s for s in hist if s["start_time"] >= window_end - timedelta(days=3)]
+            if not recent:
+                continue
+            forecast_sessions = []
+            for day_offset in range(1, args.forecast_days + 1):
+                for s in recent:
+                    jitter_minutes = random.randint(-10, 15)
+                    start_time = s["start_time"] + timedelta(days=day_offset, minutes=jitter_minutes)
+                    end_time = s["end_time"] + timedelta(days=day_offset, minutes=jitter_minutes)
+                    if end_time > forecast_end:
+                        continue
+                    duration = int((end_time - start_time).total_seconds() / 60)
+                    energy = max(0.1, s["energy_kwh"] * random.uniform(0.9, 1.1))
+                    forecast_sessions.append(
+                        {
+                            **s,
+                            "session_id": uuid.uuid4(),
+                            "start_time": start_time,
+                            "end_time": end_time,
+                            "duration_minutes": duration,
+                            "energy_kwh": round(energy, 2),
+                            "success": random.random() > 0.08,
+                        }
+                    )
+            forecast_sessions.sort(key=lambda x: x["start_time"])
+            sessions_by_charger[charger["charger_id"]].extend(forecast_sessions)
+            all_sessions.extend(forecast_sessions)
+
     print("Inserting charging sessions...")
     session_count = insert_charging_sessions(engine, all_sessions)
     print(f"Inserted {session_count} charging sessions")
@@ -600,10 +635,11 @@ def main() -> None:
 def parse_args() -> argparse.Namespace:
     """CLI options so you can scale data volume for demos/load-testing."""
     parser = argparse.ArgumentParser(description="Generate synthetic EV charging data into TimescaleDB.")
-    parser.add_argument("--days", type=int, default=30, help="Number of days of history to generate (default: 30)")
-    parser.add_argument("--sites", type=int, default=5, help="How many sites to seed (default: 5)")
-    parser.add_argument("--chargers", type=int, default=40, help="How many chargers to seed (default: 40)")
+    parser.add_argument("--days", type=int, default=7, help="Number of days of history to generate (default: 7)")
+    parser.add_argument("--sites", type=int, default=4, help="How many sites to seed (default: 4)")
+    parser.add_argument("--chargers", type=int, default=20, help="How many chargers to seed (default: 20)")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--forecast-days", type=int, default=0, help="Forecast horizon (days) to extend sessions into future")
     return parser.parse_args()
 
 
