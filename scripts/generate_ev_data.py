@@ -103,6 +103,16 @@ SITE_SEED: Sequence[Dict[str, object]] = [
 CONNECTOR_TYPES = ["CCS", "CHAdeMO", "NACS", "Type2"]
 CHARGER_MODELS = ["Delta-50", "ABB-Terra", "ChargePoint-Express", "EVgo-Fast"]
 
+# Tuning knobs for fault patterns and sampling realism
+RANDOM_FAULT_PROB = 0.02  # base chance a non-outage ping is FAULTED
+RANDOM_OFFLINE_PROB = 0.005  # base chance a non-outage ping is OFFLINE
+PING_DROP_PROB = 0.03  # chance to drop a ping entirely
+TIME_JITTER_SECONDS = 20  # jitter timestamps +/- this many seconds
+
+# Daily fault block probabilities (per charger per day)
+DAILY_FAULT_BLOCK_PROB = 0.2  # 30–60 minute FAULTED block
+DAILY_OFFLINE_BLOCK_PROB = 0.12  # 20–45 minute OFFLINE block
+
 
 def init_schema(engine) -> None:
     schema_sql = """
@@ -219,6 +229,8 @@ def build_chargers(sites: Sequence[Dict[str, object]], total: int = 50) -> List[
     install_window_days = 365 * 2
     now = datetime.now(timezone.utc)
 
+    problem_children = set(random.sample(range(total), k=min(2, total)))  # higher fault rates
+
     for idx in range(total):
         site = random.choice(sites)
         power = random.choice([50, 75, 120, 150, 250])
@@ -231,6 +243,7 @@ def build_chargers(sites: Sequence[Dict[str, object]], total: int = 50) -> List[
                 "max_power_kw": float(power),
                 "connector_type": random.choice(CONNECTOR_TYPES),
                 "installed_at": now - timedelta(days=random.randint(30, install_window_days)),
+                "fault_multiplier": 3.0 if idx in problem_children else 1.0,
             }
         )
     return chargers
@@ -263,19 +276,41 @@ def seed_chargers(engine, chargers: Sequence[Dict[str, object]]) -> List[Dict[st
 
 def generate_outage_windows(start: datetime, end: datetime) -> List[Tuple[datetime, datetime, str]]:
     windows: List[Tuple[datetime, datetime, str]] = []
-    outage_count = random.randint(1, 4)
+    outage_count = random.randint(2, 6)  # more outages to surface faults
     total_span_minutes = int((end - start).total_seconds() / 60)
 
     for _ in range(outage_count):
         offset_minutes = random.randint(0, max(total_span_minutes - 120, 1))
         window_start = start + timedelta(minutes=offset_minutes)
-        window_end = window_start + timedelta(minutes=random.randint(10, 90))
+        window_end = window_start + timedelta(minutes=random.randint(20, 180))
         if window_end > end:
             window_end = end
         windows.append((window_start, window_end, random.choice(["FAULTED", "OFFLINE"])))
 
     windows.sort(key=lambda w: w[0])
     return windows
+
+
+def generate_daily_fault_blocks(
+    start: datetime, end: datetime, fault_mult: float
+) -> List[Tuple[datetime, datetime, str]]:
+    """Per-day fault/offline windows with small probabilities."""
+    blocks: List[Tuple[datetime, datetime, str]] = []
+    days = (end - start).days
+    for i in range(days):
+        day_start = start + timedelta(days=i)
+        # Faulted block
+        if random.random() < DAILY_FAULT_BLOCK_PROB * fault_mult:
+            win_start = day_start + timedelta(minutes=random.randint(0, (24 * 60) - 60))
+            win_end = win_start + timedelta(minutes=random.randint(30, 60))
+            blocks.append((win_start, win_end, "FAULTED"))
+        # Offline block
+        if random.random() < DAILY_OFFLINE_BLOCK_PROB * fault_mult:
+            win_start = day_start + timedelta(minutes=random.randint(0, (24 * 60) - 45))
+            win_end = win_start + timedelta(minutes=random.randint(20, 45))
+            blocks.append((win_start, win_end, "OFFLINE"))
+    blocks.sort(key=lambda w: w[0])
+    return blocks
 
 
 def generate_charging_sessions(
@@ -286,11 +321,26 @@ def generate_charging_sessions(
 
     for day_offset in range(days):
         day_start = start + timedelta(days=day_offset)
-        session_count = random.randint(1, 4)
+        weekday = (day_start.weekday() <= 4)
+        # More usage on weekdays; reduced on weekends
+        session_count = random.randint(2, 5) if weekday else random.randint(0, 3)
 
         for _ in range(session_count):
-            session_start = day_start + timedelta(minutes=random.randint(0, (24 * 60) - 90))
-            duration_minutes = random.randint(10, 90)
+            # Bias start times toward commute/daytime hours; fewer sessions 2–4 a.m.
+            hours = list(range(24))
+            weights = [1]*24
+            for h in range(7, 10):
+                weights[h] = 4  # morning bump
+            for h in range(17, 21):
+                weights[h] = 4  # evening bump
+            for h in range(2, 5):
+                weights[h] = 0.5  # very low at night
+            if not weekday:
+                weights = [w*0.8 for w in weights]  # slightly lower weekend overall
+            start_hour = random.choices(hours, weights=weights, k=1)[0]
+            start_minute = random.randint(0, 59)
+            session_start = day_start + timedelta(hours=start_hour, minutes=start_minute)
+            duration_minutes = random.randint(15, 90)
             session_end = session_start + timedelta(minutes=duration_minutes)
             if session_end >= end:
                 continue
@@ -333,14 +383,20 @@ def generate_status_events(
 ) -> List[Dict[str, object]]:
     events: List[Dict[str, object]] = []
     outage_windows = generate_outage_windows(start, end)
+    fault_blocks = generate_daily_fault_blocks(start, end, charger.get("fault_multiplier", 1.0))
+    all_windows = outage_windows + fault_blocks
+    all_windows.sort(key=lambda w: w[0])
     session_index = 0
     current_time = start
 
     def active_outage(ts: datetime) -> Optional[str]:
-        for window_start, window_end, status in outage_windows:
+        for window_start, window_end, status in all_windows:
             if window_start <= ts <= window_end:
                 return status
         return None
+
+    fault_prob = RANDOM_FAULT_PROB * charger.get("fault_multiplier", 1.0)
+    offline_prob = RANDOM_OFFLINE_PROB * charger.get("fault_multiplier", 1.0)
 
     while current_time <= end:
         current_session: Optional[Dict[str, object]] = None
@@ -360,24 +416,36 @@ def generate_status_events(
             status = "CHARGING"
             session_id = current_session["session_id"]
         else:
-            status = random.choices(["AVAILABLE", "CHARGING"], weights=[0.6, 0.4])[0]
+            # Introduce occasional random faults/offline states outside scheduled outages.
+            roll = random.random()
+            if roll < offline_prob:
+                status = "OFFLINE"
+            elif roll < offline_prob + fault_prob:
+                status = "FAULTED"
+            else:
+                status = random.choices(["AVAILABLE", "CHARGING"], weights=[0.6, 0.4])[0]
             session_id = None
 
         error_code = None
         if status == "FAULTED":
             error_code = random.choice(["OVERCURRENT", "GROUND_FAULT", "PILOT_FAILURE", "COMM_LOSS"])
 
-        temperature = round(random.normalvariate(24, 5), 2)
-        events.append(
-            {
-                "time": current_time,
-                "charger_id": charger["charger_id"],
-                "status": status,
-                "error_code": error_code,
-                "temperature_celsius": temperature,
-                "session_id": session_id,
-            }
-        )
+        if random.random() >= PING_DROP_PROB:
+            jitter = timedelta(seconds=random.randint(-TIME_JITTER_SECONDS, TIME_JITTER_SECONDS))
+            ts = current_time + jitter
+            if ts < start:
+                ts = start
+            temperature = round(random.normalvariate(24, 5), 2)
+            events.append(
+                {
+                    "time": ts,
+                    "charger_id": charger["charger_id"],
+                    "status": status,
+                    "error_code": error_code,
+                    "temperature_celsius": temperature,
+                    "session_id": session_id,
+                }
+            )
 
         current_time += timedelta(minutes=random.randint(1, 5))
 
@@ -533,8 +601,8 @@ def parse_args() -> argparse.Namespace:
     """CLI options so you can scale data volume for demos/load-testing."""
     parser = argparse.ArgumentParser(description="Generate synthetic EV charging data into TimescaleDB.")
     parser.add_argument("--days", type=int, default=30, help="Number of days of history to generate (default: 30)")
-    parser.add_argument("--sites", type=int, default=len(SITE_SEED), help="How many sites to seed (default: 10)")
-    parser.add_argument("--chargers", type=int, default=50, help="How many chargers to seed (default: 50)")
+    parser.add_argument("--sites", type=int, default=5, help="How many sites to seed (default: 5)")
+    parser.add_argument("--chargers", type=int, default=40, help="How many chargers to seed (default: 40)")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
     return parser.parse_args()
 
