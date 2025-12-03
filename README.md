@@ -44,7 +44,7 @@ pytest tests/test_db_integration.py -m integration -v
 - **TimescaleDB hypertables**: `charger_status` (1–5 min pings) and `charging_sessions` (session metadata) with indexes for charger/site queries.
 - **Synthetic generator**: realistic sites/chargers, outages, sessions; CLI flags for days/sites/chargers.
 - **Reliability API**: chargers list, charger stats, active alerts (FAULTED/OFFLINE windows), uptime/MTBF/MTTR by site/model.
-- **Streamlit dashboard**: worst chargers/sites, model/connector hotspots, adjustable window.
+- **Streamlit dashboard**: worst chargers/sites, model/connector hotspots, adjustable window; runs locally with `streamlit run scripts/streamlit_dashboard.py`.
 - **Notebooks**: utilization vs fault trends, offenders by fault rate and lost session minutes, load/fault correlation, data story summary.
 - **Tests**: integration test seeds a temp TimescaleDB, checks hypertables/indexes and data counts.
 
