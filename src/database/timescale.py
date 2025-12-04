@@ -10,8 +10,15 @@ class TimescaleDBConnection:
     """Manages TimescaleDB connections and operations."""
 
     def __init__(self, database_url: str = DATABASE_URL):
-        """Initialize database connection."""
-        self.engine = create_engine(database_url)
+        """Initialize database connection with tuned pooling."""
+        self.engine = create_engine(
+            database_url,
+            pool_size=10,
+            max_overflow=20,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            pool_use_lifo=True,
+        )
         self.SessionLocal = sessionmaker(bind=self.engine)
 
     def get_session(self) -> Session:

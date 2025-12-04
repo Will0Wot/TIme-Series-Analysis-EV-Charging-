@@ -1,7 +1,6 @@
 """Streamlit dashboard for charger reliability (uptime, fault hotspots)."""
 
 import os
-from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -20,130 +19,72 @@ from src.config import DATABASE_URL  # noqa: E402
 
 @lru_cache(maxsize=1)
 def get_engine():
-    return create_engine(DATABASE_URL)
+    return create_engine(
+        DATABASE_URL,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_use_lifo=True,
+    )
 
 
-def load_status_data(window_days: int = 7) -> pd.DataFrame:
-    """Load charger_status for recent window."""
-    engine = get_engine()
+@st.cache_data(ttl=60)
+def load_status_overview(window_days: int) -> pd.DataFrame:
+    """Lightweight overview counts computed in the database."""
     query = text(
         """
         SELECT
-            cs.time,
-            cs.charger_id,
-            cs.status,
-            cs.session_id,
+            COUNT(*) AS samples,
+            COUNT(DISTINCT charger_id) AS chargers,
+            COUNT(DISTINCT site_id) AS sites
+        FROM charger_status
+        WHERE time >= now() - interval :win
+        """
+    )
+    return pd.read_sql(query, get_engine(), params={"win": f"{window_days} days"})
+
+
+@st.cache_data(ttl=60)
+def load_reliability(level: Literal["charger", "site"], window_days: int) -> pd.DataFrame:
+    """Compute reliability metrics in SQL and cache the result."""
+    if level == "charger":
+        select_cols = """
+            c.charger_id,
+            c.external_id,
             s.site_id,
             s.name AS site_name,
-            c.external_id,
             c.model,
             c.connector_type
+        """
+        group_cols = "c.charger_id, c.external_id, s.site_id, s.name, c.model, c.connector_type"
+    else:
+        select_cols = "s.site_id, s.name AS site_name"
+        group_cols = "s.site_id, s.name"
+
+    query = text(
+        f"""
+        SELECT
+            {select_cols},
+            COUNT(*) AS samples,
+            SUM(CASE WHEN cs.status IN ('FAULTED','OFFLINE') THEN 1 ELSE 0 END) AS fault_samples,
+            SUM(CASE WHEN cs.status IN ('FAULTED','OFFLINE') THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0) AS fault_rate,
+            (1 - SUM(CASE WHEN cs.status IN ('FAULTED','OFFLINE') THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0)) * 100 AS uptime_pct
         FROM charger_status cs
         JOIN chargers c ON cs.charger_id = c.charger_id
         JOIN sites s ON c.site_id = s.site_id
         WHERE cs.time >= now() - interval :win
-    """
-    )
-    df = pd.read_sql(query, engine, params={"win": f"{window_days} days"})
-    return df
-
-
-def load_session_data(window_days: int = 30) -> pd.DataFrame:
-    """Load charging_sessions for recent window."""
-    engine = get_engine()
-    query = text(
+        GROUP BY {group_cols}
+        HAVING COUNT(*) > 0
+        ORDER BY fault_rate DESC NULLS LAST
         """
-        SELECT
-            cs.session_id,
-            cs.charger_id,
-            cs.site_id,
-            cs.start_time,
-            cs.end_time,
-            cs.duration_minutes,
-            cs.energy_kwh,
-            cs.success,
-            cs.stop_reason,
-            c.external_id,
-            c.model,
-            c.connector_type,
-            s.name AS site_name
-        FROM charging_sessions cs
-        JOIN chargers c ON cs.charger_id = c.charger_id
-        JOIN sites s ON cs.site_id = s.site_id
-        WHERE cs.start_time >= now() - interval :win
-    """
     )
-    return pd.read_sql(query, engine, params={"win": f"{window_days} days"})
+    return pd.read_sql(query, get_engine(), params={"win": f"{window_days} days"})
 
 
-def compute_reliability(df: pd.DataFrame, level: Literal["charger", "site"] = "charger") -> pd.DataFrame:
-    """Compute uptime/fault rate per charger or site."""
-    key_cols = ["charger_id", "external_id", "site_id", "site_name", "model", "connector_type"]
-    if level == "site":
-        key_cols = ["site_id", "site_name"]
-
-    grouped = (
-        df.groupby(key_cols)
-        .agg(
-            samples=("status", "count"),
-            fault_samples=("status", lambda s: (s.isin(["FAULTED", "OFFLINE"])).sum()),
-        )
-        .reset_index()
-    )
-    grouped["fault_rate"] = grouped["fault_samples"] / grouped["samples"]
-    grouped["uptime_pct"] = (1 - grouped["fault_rate"]) * 100
-    return grouped.sort_values("fault_rate", ascending=False)
-
-
-def load_charger_metadata() -> pd.DataFrame:
-    engine = get_engine()
-    df = pd.read_sql(
-        text(
-            """
-            SELECT c.charger_id,
-                   c.external_id,
-                   c.model,
-                   c.connector_type,
-                   c.max_power_kw,
-                   s.site_id,
-                   s.name AS site_name,
-                   s.city,
-                   s.country
-            FROM chargers c
-            JOIN sites s ON c.site_id = s.site_id
-            """
-        ),
-        engine,
-    )
-    return df
-
-
-def main():
-    st.set_page_config(page_title="Charger Reliability", layout="wide")
-    st.title("Charger Reliability Dashboard")
-    st.caption("Uptime and fault hotspots from charger_status (TimescaleDB)")
-
-    status_window = st.sidebar.slider("Status window (days)", min_value=1, max_value=30, value=7, step=1)
-    session_window = st.sidebar.slider("Sessions window (days)", min_value=7, max_value=60, value=30, step=1)
-    df_status = load_status_data(window_days=status_window)
-    df_sessions = load_session_data(window_days=session_window)
-    meta = load_charger_metadata()
-
-    if df_status.empty:
-        st.warning("No status data in the selected window.")
-        return
-
-    st.subheader(f"Overview (status last {status_window} days | sessions last {session_window} days)")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Status samples", f"{len(df_status):,}")
-    col2.metric("Chargers", f"{df_status['charger_id'].nunique():,}")
-    col3.metric("Sites", f"{df_status['site_id'].nunique():,}")
-
-    per_charger = compute_reliability(df_status, level="charger")
-    per_site = compute_reliability(df_status, level="site")
-
-    # Business visuals
-    st.subheader("Fault rate vs utilization (last 7 days)")
+@st.cache_data(ttl=60)
+def load_fault_vs_utilization() -> pd.DataFrame:
+    """Join fault rate and utilization time series in SQL."""
     fault_hourly = pd.read_sql(
         text(
             """
@@ -172,7 +113,104 @@ def main():
     )
     merged = fault_hourly.merge(util_hourly, on="hour", how="outer").fillna(0)
     merged["fault_rate_pct"] = merged["fault_rate"] * 100
-    corr = merged[["fault_rate", "hours_used"]].corr().iloc[0, 1]
+    return merged
+
+
+@st.cache_data(ttl=60)
+def load_top_fault_chargers(window_days: int = 14) -> pd.DataFrame:
+    query = text(
+        """
+        SELECT
+            c.external_id,
+            s.name AS site_name,
+            c.model,
+            c.connector_type,
+            COUNT(*) AS samples,
+            SUM(CASE WHEN cs.status IN ('FAULTED','OFFLINE') THEN 1 ELSE 0 END)::float / COUNT(*) AS fault_rate
+        FROM charger_status cs
+        JOIN chargers c ON cs.charger_id = c.charger_id
+        JOIN sites s ON c.site_id = s.site_id
+        WHERE cs.time >= now() - interval :win
+        GROUP BY c.external_id, s.name, c.model, c.connector_type
+        HAVING COUNT(*) > 0
+        ORDER BY fault_rate DESC
+        LIMIT 10
+        """
+    )
+    return pd.read_sql(query, get_engine(), params={"win": f"{window_days} days"})
+
+
+@st.cache_data(ttl=60)
+def load_top_lost_minutes(window_days: int = 30) -> pd.DataFrame:
+    query = text(
+        """
+        SELECT
+            c.external_id,
+            s.name AS site_name,
+            c.model,
+            c.connector_type,
+            COUNT(*) AS sessions,
+            SUM(duration_minutes) AS total_minutes,
+            SUM(CASE WHEN success = false THEN duration_minutes ELSE 0 END) AS lost_minutes
+        FROM charging_sessions cs
+        JOIN chargers c ON cs.charger_id = c.charger_id
+        JOIN sites s ON c.site_id = s.site_id
+        WHERE cs.start_time >= now() - interval :win
+        GROUP BY c.external_id, s.name, c.model, c.connector_type
+        HAVING SUM(CASE WHEN success = false THEN duration_minutes ELSE 0 END) > 0
+        ORDER BY lost_minutes DESC
+        LIMIT 10
+        """
+    )
+    return pd.read_sql(query, get_engine(), params={"win": f"{window_days} days"})
+
+
+@st.cache_data(ttl=60)
+def load_model_faults() -> pd.DataFrame:
+    query = text(
+        """
+        SELECT
+            c.model,
+            c.connector_type,
+            COUNT(*) AS samples,
+            SUM(CASE WHEN cs.status IN ('FAULTED','OFFLINE') THEN 1 ELSE 0 END)::float / COUNT(*) AS fault_rate
+        FROM charger_status cs
+        JOIN chargers c ON cs.charger_id = c.charger_id
+        WHERE cs.time >= now() - interval '14 days'
+        GROUP BY c.model, c.connector_type
+        HAVING COUNT(*) > 0
+        ORDER BY fault_rate DESC
+        """
+    )
+    return pd.read_sql(query, get_engine())
+
+
+def main():
+    st.set_page_config(page_title="Charger Reliability", layout="wide")
+    st.title("Charger Reliability Dashboard")
+    st.caption("Uptime and fault hotspots from charger_status (TimescaleDB)")
+
+    status_window = st.sidebar.slider("Status window (days)", min_value=1, max_value=30, value=7, step=1)
+    session_window = st.sidebar.slider("Sessions window (days)", min_value=7, max_value=60, value=30, step=1)
+
+    overview = load_status_overview(status_window)
+    if overview.empty or overview.loc[0, "samples"] == 0:
+        st.warning("No status data in the selected window.")
+        return
+
+    st.subheader(f"Overview (status last {status_window} days | sessions last {session_window} days)")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Status samples", f"{int(overview.loc[0, 'samples']):,}")
+    col2.metric("Chargers", f"{int(overview.loc[0, 'chargers']):,}")
+    col3.metric("Sites", f"{int(overview.loc[0, 'sites']):,}")
+
+    per_charger = load_reliability("charger", status_window)
+    per_site = load_reliability("site", status_window)
+
+    # Business visuals
+    st.subheader("Fault rate vs utilization (last 7 days)")
+    merged = load_fault_vs_utilization()
+    corr = merged[["fault_rate", "hours_used"]].corr().iloc[0, 1] if not merged.empty else 0.0
     fig_corr = px.line(
         merged,
         x="hour",
@@ -184,28 +222,7 @@ def main():
     st.plotly_chart(fig_corr, use_container_width=True)
 
     st.subheader("Top chargers by fault rate (last 14 days)")
-    top_fault = pd.read_sql(
-        text(
-            """
-            SELECT
-                c.external_id,
-                s.name AS site_name,
-                c.model,
-                c.connector_type,
-                COUNT(*) AS samples,
-                SUM(CASE WHEN cs.status IN ('FAULTED','OFFLINE') THEN 1 ELSE 0 END)::float / COUNT(*) AS fault_rate
-            FROM charger_status cs
-            JOIN chargers c ON cs.charger_id = c.charger_id
-            JOIN sites s ON c.site_id = s.site_id
-            WHERE cs.time >= now() - interval '14 days'
-            GROUP BY c.external_id, s.name, c.model, c.connector_type
-            HAVING COUNT(*) > 0
-            ORDER BY fault_rate DESC
-            LIMIT 10
-            """
-        ),
-        get_engine(),
-    )
+    top_fault = load_top_fault_chargers(window_days=min(status_window, 14))
     fig_fault = px.bar(
         top_fault,
         x="external_id",
@@ -218,29 +235,7 @@ def main():
     st.plotly_chart(fig_fault, use_container_width=True)
 
     st.subheader("Top chargers by lost session minutes (last 30 days)")
-    lost = pd.read_sql(
-        text(
-            """
-            SELECT
-                c.external_id,
-                s.name AS site_name,
-                c.model,
-                c.connector_type,
-                COUNT(*) AS sessions,
-                SUM(duration_minutes) AS total_minutes,
-                SUM(CASE WHEN success = false THEN duration_minutes ELSE 0 END) AS lost_minutes
-            FROM charging_sessions cs
-            JOIN chargers c ON cs.charger_id = c.charger_id
-            JOIN sites s ON c.site_id = s.site_id
-            WHERE cs.start_time >= now() - interval '30 days'
-            GROUP BY c.external_id, s.name, c.model, c.connector_type
-            HAVING SUM(CASE WHEN success = false THEN duration_minutes ELSE 0 END) > 0
-            ORDER BY lost_minutes DESC
-            LIMIT 10
-            """
-        ),
-        get_engine(),
-    )
+    lost = load_top_lost_minutes(window_days=session_window)
     fig_lost = px.bar(
         lost,
         x="external_id",
@@ -253,24 +248,7 @@ def main():
     st.plotly_chart(fig_lost, use_container_width=True)
 
     st.subheader("Fault rate by model / connector (last 14 days)")
-    model_faults = pd.read_sql(
-        text(
-            """
-            SELECT
-                c.model,
-                c.connector_type,
-                COUNT(*) AS samples,
-                SUM(CASE WHEN cs.status IN ('FAULTED','OFFLINE') THEN 1 ELSE 0 END)::float / COUNT(*) AS fault_rate
-            FROM charger_status cs
-            JOIN chargers c ON cs.charger_id = c.charger_id
-            WHERE cs.time >= now() - interval '14 days'
-            GROUP BY c.model, c.connector_type
-            HAVING COUNT(*) > 0
-            ORDER BY fault_rate DESC
-            """
-        ),
-        get_engine(),
-    )
+    model_faults = load_model_faults()
     fig_model = px.bar(
         model_faults,
         x="model",

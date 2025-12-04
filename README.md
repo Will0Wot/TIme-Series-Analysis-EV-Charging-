@@ -20,6 +20,9 @@ python scripts/generate_ev_data.py
 # python scripts/generate_ev_data.py --days 7 --sites 5 --chargers 12 --random-seed 123
 
 # 4) Run API (FastAPI)
+# Prod-lean (uvloop + multiple workers):
+uvicorn src.api.main:app --loop uvloop --http httptools --workers 4
+# Dev hot-reload:
 python -m uvicorn src.api.main:app --reload
 # Docs: http://localhost:8000/docs
 # Key endpoints: /api/chargers, /api/chargers/{id}/stats, /api/alerts, /api/reliability?scope=site|model&days=N

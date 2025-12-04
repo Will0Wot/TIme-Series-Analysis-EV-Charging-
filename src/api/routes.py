@@ -1,13 +1,14 @@
 """API routes for EV charging analysis."""
 from datetime import datetime
 from decimal import Decimal
-from typing import List, Optional
+import time
+from typing import Dict, List, Optional, Tuple
 
 from src.api.compat import patch_pydantic_forward_refs
 
 patch_pydantic_forward_refs()
 
-from fastapi import APIRouter, HTTPException  # noqa: E402
+from fastapi import APIRouter, HTTPException, Response  # noqa: E402
 from fastapi.concurrency import run_in_threadpool  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 from sqlalchemy import text  # noqa: E402
@@ -15,6 +16,10 @@ from sqlalchemy import text  # noqa: E402
 from src.database.timescale import db  # noqa: E402
 
 router = APIRouter()
+
+# Simple TTL cache for reliability metrics to avoid recomputing heavy window functions
+_reliability_cache: Dict[Tuple[str, int], Tuple[float, List[dict]]] = {}
+_RELIABILITY_TTL_SECONDS = 60
 
 
 def _to_float(value: Optional[Decimal]) -> Optional[float]:
@@ -83,7 +88,7 @@ class ReliabilityMetric(BaseModel):
 
 
 @router.get("/api/chargers", response_model=List[ChargerInfo])
-async def list_chargers():
+async def list_chargers(response: Response):
     """Get list of all chargers with latest status."""
 
     def _query() -> List[dict]:
@@ -126,114 +131,149 @@ async def list_chargers():
         finally:
             session.close()
 
-    return await run_in_threadpool(_query)
+    data = await run_in_threadpool(_query)
+    response.headers["Cache-Control"] = "public, max-age=30"
+    return data
 
 
 @router.get("/api/chargers/{charger_id}/stats", response_model=ChargerStats)
 async def get_charger_stats(charger_id: int):
-    """Get statistics and recent activity for a specific charger."""
+    """Get statistics and recent activity for a specific charger with one DB round-trip."""
 
     def _query() -> dict:
         session = db.get_session()
         try:
-            charger_row = session.execute(
+            row = session.execute(
                 text(
                     """
+                    WITH base AS (
+                        SELECT
+                            c.charger_id,
+                            c.external_id,
+                            c.model,
+                            c.max_power_kw,
+                            c.connector_type,
+                            c.site_id,
+                            s.name AS site_name,
+                            s.city,
+                            s.country
+                        FROM chargers c
+                        JOIN sites s ON c.site_id = s.site_id
+                        WHERE c.charger_id = :cid
+                    ),
+                    agg AS (
+                        SELECT
+                            COUNT(*) AS sessions,
+                            SUM(energy_kwh) AS total_energy_kwh,
+                            AVG(duration_minutes) AS avg_duration_minutes,
+                            MIN(start_time) AS first_session,
+                            MAX(end_time) AS last_session
+                        FROM charging_sessions
+                        WHERE charger_id = :cid
+                    ),
+                    last_status AS (
+                        SELECT status, time
+                        FROM charger_status
+                        WHERE charger_id = :cid
+                        ORDER BY time DESC
+                        LIMIT 1
+                    ),
+                    recent_sessions AS (
+                        SELECT
+                            session_id,
+                            start_time,
+                            end_time,
+                            duration_minutes,
+                            energy_kwh,
+                            success,
+                            stop_reason
+                        FROM charging_sessions
+                        WHERE charger_id = :cid
+                        ORDER BY start_time DESC
+                        LIMIT 5
+                    )
                     SELECT
-                        c.charger_id,
-                        c.external_id,
-                        c.model,
-                        c.max_power_kw,
-                        c.connector_type,
-                        c.site_id,
-                        s.name AS site_name,
-                        s.city,
-                        s.country
-                    FROM chargers c
-                    JOIN sites s ON c.site_id = s.site_id
-                    WHERE c.charger_id = :cid
+                        b.charger_id,
+                        b.external_id,
+                        b.model,
+                        b.max_power_kw,
+                        b.connector_type,
+                        b.site_id,
+                        b.site_name,
+                        b.city,
+                        b.country,
+                        ls.status AS last_status,
+                        ls.time AS last_seen,
+                        agg.sessions,
+                        agg.total_energy_kwh,
+                        agg.avg_duration_minutes,
+                        agg.first_session,
+                        agg.last_session,
+                        ls.status AS last_status_value,
+                        ls.time AS last_status_time,
+                        COALESCE(
+                            (
+                                SELECT json_agg(r ORDER BY r.start_time DESC)
+                                FROM (
+                                    SELECT
+                                        session_id,
+                                        start_time,
+                                        end_time,
+                                        duration_minutes,
+                                        energy_kwh,
+                                        success,
+                                        stop_reason
+                                    FROM recent_sessions
+                                ) r
+                            ), '[]'::json
+                        ) AS recent_sessions
+                    FROM base b
+                    LEFT JOIN agg ON TRUE
+                    LEFT JOIN last_status ls ON TRUE;
                     """
                 ),
                 {"cid": charger_id},
             ).mappings().first()
 
-            if not charger_row:
+            if not row:
                 raise HTTPException(status_code=404, detail="Charger not found")
 
-            last_status = session.execute(
-                text(
-                    """
-                    SELECT status, time
-                    FROM charger_status
-                    WHERE charger_id = :cid
-                    ORDER BY time DESC
-                    LIMIT 1
-                    """
-                ),
-                {"cid": charger_id},
-            ).mappings().first()
-
-            session_summary = session.execute(
-                text(
-                    """
-                    SELECT
-                        count(*) AS sessions,
-                        sum(energy_kwh) AS total_energy_kwh,
-                        avg(duration_minutes) AS avg_duration_minutes,
-                        min(start_time) AS first_session,
-                        max(end_time) AS last_session
-                    FROM charging_sessions
-                    WHERE charger_id = :cid
-                    """
-                ),
-                {"cid": charger_id},
-            ).mappings().first()
-
-            recent_sessions = session.execute(
-                text(
-                    """
-                    SELECT
-                        session_id,
-                        start_time,
-                        end_time,
-                        duration_minutes,
-                        energy_kwh,
-                        success,
-                        stop_reason
-                    FROM charging_sessions
-                    WHERE charger_id = :cid
-                    ORDER BY start_time DESC
-                    LIMIT 5
-                    """
-                ),
-                {"cid": charger_id},
-            ).mappings().all()
-
-            charger_info = dict(charger_row)
+            charger_info = {
+                key: row[key]
+                for key in [
+                    "charger_id",
+                    "external_id",
+                    "model",
+                    "max_power_kw",
+                    "connector_type",
+                    "site_id",
+                    "site_name",
+                    "city",
+                    "country",
+                    "last_status",
+                    "last_seen",
+                ]
+            }
             charger_info["max_power_kw"] = _to_float(charger_info.get("max_power_kw")) or 0.0
-            if last_status:
-                charger_info["last_status"] = last_status["status"]
-                charger_info["last_seen"] = last_status["time"]
-            else:
-                charger_info["last_status"] = None
-                charger_info["last_seen"] = None
+
+            recent_sessions = [
+                {
+                    **sess,
+                    "energy_kwh": _to_float(sess.get("energy_kwh")) or 0.0,
+                }
+                for sess in (row["recent_sessions"] or [])
+            ]
 
             return {
                 "charger": charger_info,
-                "sessions": int(session_summary["sessions"] or 0),
-                "total_energy_kwh": _to_float(session_summary["total_energy_kwh"]) or 0.0,
-                "avg_duration_minutes": _to_float(session_summary["avg_duration_minutes"]),
-                "first_session": session_summary["first_session"],
-                "last_session": session_summary["last_session"],
-                "last_status": last_status["status"] if last_status else None,
-                "last_status_time": last_status["time"] if last_status else None,
-                "recent_sessions": [
-                    {
-                        **dict(row),
-                        "energy_kwh": _to_float(row["energy_kwh"]) or 0.0,
-                    }
-                    for row in recent_sessions
-                ],
+                "sessions": int(row.get("sessions") or 0),
+                "total_energy_kwh": _to_float(row.get("total_energy_kwh")) or 0.0,
+                "avg_duration_minutes": _to_float(row.get("avg_duration_minutes")),
+                "first_session": row.get("first_session"),
+                "last_session": row.get("last_session"),
+                "last_status": row.get("last_status_value"),
+                "last_status_time": row.get("last_status_time"),
+                "recent_sessions": recent_sessions,
             }
         finally:
             session.close()
@@ -322,74 +362,87 @@ async def get_active_alerts():
 
 
 @router.get("/api/reliability", response_model=List[ReliabilityMetric])
-async def get_reliability_metrics(scope: str = "site", days: int = 7):
-    """Uptime/fault metrics and MTBF/MTTR grouped by site or model."""
+async def get_reliability_metrics(scope: str = "site", days: int = 7, response: Response = None):
+    """Uptime/fault metrics and MTBF/MTTR grouped by site or model with a short TTL cache."""
     if scope not in {"site", "model"}:
         raise HTTPException(status_code=400, detail="scope must be 'site' or 'model'")
+
+    cache_key = (scope, days)
+    now_ts = time.time()
+    cached = _reliability_cache.get(cache_key)
+    if cached and (now_ts - cached[0]) < _RELIABILITY_TTL_SECONDS:
+        if response:
+            response.headers["Cache-Control"] = f"public, max-age={_RELIABILITY_TTL_SECONDS}"
+        return cached[1]
 
     def _query() -> List[dict]:
         session = db.get_session()
         try:
+            view_exists = bool(session.execute(text("SELECT to_regclass('charger_status_hourly')")).scalar())
             if scope == "site":
                 group_cols = "site_id, site_name"
-                key_expr = "fr.site_name"
-                join_condition = "fr.site_id = m.site_id AND fr.site_name = m.site_name"
+                key_expr = "metric.site_name"
+                join_condition = "metric.site_id = meta.site_id AND metric.site_name = meta.site_name"
             else:
                 group_cols = "model, connector_type"
-                key_expr = "fr.model"
-                join_condition = "fr.model = m.model AND fr.connector_type = m.connector_type"
+                key_expr = "metric.model"
+                join_condition = "metric.model = meta.model AND metric.connector_type = meta.connector_type"
+
+            view_cte = ""
+            if view_exists:
+                view_cte = f"""
+                        SELECT
+                            {group_cols},
+                            SUM(fault_minutes) AS fault_minutes,
+                            SUM(total_minutes) AS total_minutes,
+                            SUM(samples) AS samples,
+                            AVG(mtbf_minutes) AS mtbf_minutes,
+                            AVG(mttr_minutes) AS mttr_minutes
+                        FROM charger_status_hourly
+                        WHERE bucket >= now() - interval :win
+                        GROUP BY {group_cols}
+                        UNION ALL
+                """
+
             data = session.execute(
                 text(
                     f"""
-                    WITH recent AS (
+                    -- Prefer continuous aggregate if present, otherwise fall back to raw window
+                    WITH metric AS (
+                        {view_cte}
                         SELECT
-                            cs.charger_id,
-                            cs.status,
-                            cs.time,
-                            c.model,
-                            c.connector_type,
-                            s.site_id,
-                            s.name as site_name,
-                            lead(cs.time) over (partition by cs.charger_id order by cs.time) as next_time,
-                            lag(cs.status) over (partition by cs.charger_id order by cs.time) as prev_status
+                            {group_cols},
+                            SUM(CASE WHEN status IN ('FAULTED','OFFLINE') THEN EXTRACT(EPOCH FROM (COALESCE(lead(time) over (partition by charger_id order by time), now()) - time))/60.0 ELSE 0 END) AS fault_minutes,
+                            SUM(EXTRACT(EPOCH FROM (COALESCE(lead(time) over (partition by charger_id order by time), now()) - time))/60.0) AS total_minutes,
+                            COUNT(*) AS samples,
+                            AVG(CASE WHEN status NOT IN ('FAULTED','OFFLINE') THEN EXTRACT(EPOCH FROM (COALESCE(lead(time) over (partition by charger_id order by time), now()) - time))/60.0 END) AS mtbf_minutes,
+                            AVG(CASE WHEN status IN ('FAULTED','OFFLINE') THEN EXTRACT(EPOCH FROM (COALESCE(lead(time) over (partition by charger_id order by time), now()) - time))/60.0 END) AS mttr_minutes
                         FROM charger_status cs
                         JOIN chargers c ON cs.charger_id = c.charger_id
                         JOIN sites s ON c.site_id = s.site_id
                         WHERE cs.time >= now() - interval :win
-                    ),
-                    durations AS (
-                        SELECT
-                            {group_cols},
-                            status,
-                            EXTRACT(EPOCH FROM (COALESCE(next_time, now()) - time))/60.0 as minutes
-                        FROM recent
-                    ),
-                    mttr_mtbf AS (
-                        SELECT
-                            {group_cols},
-                            AVG(CASE WHEN status IN ('FAULTED','OFFLINE') THEN minutes END) as mttr_minutes,
-                            AVG(CASE WHEN status NOT IN ('FAULTED','OFFLINE') THEN minutes END) as mtbf_minutes
-                        FROM durations
                         GROUP BY {group_cols}
                     ),
-                    fault_rates AS (
-                        SELECT
-                            {group_cols},
-                            COUNT(*) AS samples,
-                            SUM(CASE WHEN status IN ('FAULTED','OFFLINE') THEN 1 ELSE 0 END) AS faults
-                        FROM recent
-                        GROUP BY {group_cols}
+                    metric_ranked AS (
+                        SELECT *, row_number() over (partition by {group_cols} order by total_minutes DESC) AS rk
+                        FROM metric
+                    ),
+                    meta AS (
+                        SELECT DISTINCT {group_cols}
+                        FROM chargers c
+                        JOIN sites s ON c.site_id = s.site_id
                     )
                     SELECT
                         {key_expr} AS key,
                         {f"'{scope}'"} AS scope,
-                        fr.samples,
-                        fr.faults::float / NULLIF(fr.samples,0) AS fault_rate,
-                        (1 - fr.faults::float / NULLIF(fr.samples,0)) * 100 AS uptime_pct,
+                        m.samples,
+                        CASE WHEN m.total_minutes = 0 THEN 0 ELSE m.fault_minutes / m.total_minutes END AS fault_rate,
+                        (1 - CASE WHEN m.total_minutes = 0 THEN 0 ELSE m.fault_minutes / m.total_minutes END) * 100 AS uptime_pct,
                         m.mtbf_minutes,
                         m.mttr_minutes
-                    FROM fault_rates fr
-                    JOIN mttr_mtbf m ON ({join_condition})
+                    FROM metric_ranked m
+                    JOIN meta ON ({join_condition})
+                    WHERE m.rk = 1
                     ORDER BY fault_rate DESC NULLS LAST;
                     """
                 ),
@@ -413,7 +466,11 @@ async def get_reliability_metrics(scope: str = "site", days: int = 7):
         finally:
             session.close()
 
-    return await run_in_threadpool(_query)
+    results = await run_in_threadpool(_query)
+    _reliability_cache[cache_key] = (now_ts, results)
+    if response:
+        response.headers["Cache-Control"] = f"public, max-age={_RELIABILITY_TTL_SECONDS}"
+    return results
 
 
 @router.get("/health")

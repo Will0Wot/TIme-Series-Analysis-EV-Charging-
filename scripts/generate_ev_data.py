@@ -1,6 +1,7 @@
 """Generate synthetic EV charging data and load it into TimescaleDB."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import random
 import sys
@@ -9,6 +10,7 @@ import uuid
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy import create_engine, text
+from psycopg2.extras import execute_values
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -115,7 +117,7 @@ DAILY_OFFLINE_BLOCK_PROB = 0.4  # 20–45 minute OFFLINE block
 
 
 def init_schema(engine) -> None:
-    schema_sql = """
+    base_sql = """
     CREATE EXTENSION IF NOT EXISTS timescaledb;
 
     CREATE TABLE IF NOT EXISTS sites (
@@ -150,6 +152,7 @@ def init_schema(engine) -> None:
     );
     SELECT create_hypertable('charger_status', 'time', if_not_exists => true, chunk_time_interval => interval '3 days');
     CREATE INDEX IF NOT EXISTS idx_charger_status_charger ON charger_status (charger_id, time DESC);
+    CREATE INDEX IF NOT EXISTS idx_charger_status_faults ON charger_status (charger_id, time DESC) WHERE status IN ('FAULTED','OFFLINE');
 
     CREATE TABLE IF NOT EXISTS charging_sessions (
         session_id UUID NOT NULL,
@@ -179,8 +182,53 @@ def init_schema(engine) -> None:
     CREATE INDEX IF NOT EXISTS idx_sessions_charger ON charging_sessions (charger_id, start_time DESC);
     CREATE INDEX IF NOT EXISTS idx_sessions_site ON charging_sessions (site_id, start_time DESC);
     """
+
+    cagg_sql = """
+    CREATE MATERIALIZED VIEW IF NOT EXISTS charger_status_hourly
+    WITH (timescaledb.continuous) AS
+    SELECT
+        time_bucket('1 hour', time) AS bucket,
+        s.site_id,
+        s.name AS site_name,
+        c.model,
+        c.connector_type,
+        COUNT(*) * 5 AS total_minutes, -- approximate minutes assuming 5-minute sampling
+        SUM(CASE WHEN status IN ('FAULTED','OFFLINE') THEN 1 ELSE 0 END) * 5 AS fault_minutes,
+        COUNT(*) AS samples,
+        NULL::double precision AS mtbf_minutes,
+        NULL::double precision AS mttr_minutes
+    FROM charger_status cs
+    JOIN chargers c ON cs.charger_id = c.charger_id
+    JOIN sites s ON c.site_id = s.site_id
+    GROUP BY bucket, s.site_id, s.name, c.model, c.connector_type;
+    """
+
+    policy_sql = [
+        """
+        SELECT add_continuous_aggregate_policy(
+            'charger_status_hourly',
+            start_offset => interval '7 days',
+            end_offset   => interval '1 hour',
+            schedule_interval => interval '15 minutes',
+            if_not_exists => true
+        );
+        """,
+        "ALTER TABLE IF EXISTS charger_status SET (timescaledb.compress, timescaledb.compress_segmentby = 'charger_id');",
+        "SELECT add_compression_policy('charger_status', interval '30 days', if_not_exists => true);",
+        "SELECT add_retention_policy('charger_status', interval '90 days', if_not_exists => true);",
+        "ALTER TABLE IF EXISTS charging_sessions SET (timescaledb.compress, timescaledb.compress_segmentby = 'charger_id');",
+        "SELECT add_compression_policy('charging_sessions', interval '60 days', if_not_exists => true);",
+        "SELECT add_retention_policy('charging_sessions', interval '180 days', if_not_exists => true);",
+    ]
+
     with engine.begin() as conn:
-        conn.execute(text(schema_sql))
+        conn.execute(text(base_sql))
+
+    # Operations that require autocommit (continuous aggregate + policies)
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(cagg_sql))
+        for stmt in policy_sql:
+            conn.execute(text(stmt))
 
 
 def reset_data(engine) -> None:
@@ -465,8 +513,7 @@ def chunked(seq: Sequence[Dict[str, object]], size: int) -> Iterable[Sequence[Di
 
 
 def insert_charging_sessions(engine, sessions: Sequence[Dict[str, object]]) -> int:
-    insert_sql = text(
-        """
+    template = """
         INSERT INTO charging_sessions (
             session_id,
             charger_id,
@@ -480,35 +527,37 @@ def insert_charging_sessions(engine, sessions: Sequence[Dict[str, object]]) -> i
             max_power_kw,
             success,
             stop_reason
-        ) VALUES (
-            :session_id,
-            :charger_id,
-            :site_id,
-            :vehicle_id,
-            :start_time,
-            :end_time,
-            :duration_minutes,
-            :energy_kwh,
-            :avg_power_kw,
-            :max_power_kw,
-            :success,
-            :stop_reason
-        )
+        ) VALUES %s
         ON CONFLICT (start_time, session_id) DO NOTHING;
-        """
-    )
+    """
+    cols = [
+        "session_id",
+        "charger_id",
+        "site_id",
+        "vehicle_id",
+        "start_time",
+        "end_time",
+        "duration_minutes",
+        "energy_kwh",
+        "avg_power_kw",
+        "max_power_kw",
+        "success",
+        "stop_reason",
+    ]
 
     inserted = 0
     with engine.begin() as conn:
-        for batch in chunked(sessions, 1000):
-            conn.execute(insert_sql, batch)
-            inserted += len(batch)
+        raw = conn.connection
+        with raw.cursor() as cur:
+            for batch in chunked(sessions, 5000):
+                values = [tuple(item.get(col) for col in cols) for item in batch]
+                execute_values(cur, template, values, page_size=1000)
+                inserted += len(batch)
     return inserted
 
 
 def insert_status_events(engine, events: Sequence[Dict[str, object]]) -> int:
-    insert_sql = text(
-        """
+    template = """
         INSERT INTO charger_status (
             time,
             charger_id,
@@ -516,23 +565,19 @@ def insert_status_events(engine, events: Sequence[Dict[str, object]]) -> int:
             error_code,
             temperature_celsius,
             session_id
-        ) VALUES (
-            :time,
-            :charger_id,
-            :status,
-            :error_code,
-            :temperature_celsius,
-            :session_id
-        )
+        ) VALUES %s
         ON CONFLICT DO NOTHING;
-        """
-    )
+    """
+    cols = ["time", "charger_id", "status", "error_code", "temperature_celsius", "session_id"]
 
     inserted = 0
     with engine.begin() as conn:
-        for batch in chunked(events, 5000):
-            conn.execute(insert_sql, batch)
-            inserted += len(batch)
+        raw = conn.connection
+        with raw.cursor() as cur:
+            for batch in chunked(events, 10000):
+                values = [tuple(item.get(col) for col in cols) for item in batch]
+                execute_values(cur, template, values, page_size=2000)
+                inserted += len(batch)
     return inserted
 
 
@@ -583,11 +628,17 @@ def main() -> None:
     all_sessions: List[Dict[str, object]] = []
     sessions_by_charger: Dict[int, List[Dict[str, object]]] = {}
 
-    print("Generating sessions...")
-    for charger in chargers:
-        charger_sessions = generate_charging_sessions(charger, window_start, window_end)
-        sessions_by_charger[charger["charger_id"]] = charger_sessions
-        all_sessions.extend(charger_sessions)
+    print(f"Generating sessions using {args.workers} worker(s)...")
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(generate_charging_sessions, charger, window_start, window_end): charger
+            for charger in chargers
+        }
+        for future in as_completed(futures):
+            charger = futures[future]
+            charger_sessions = future.result()
+            sessions_by_charger[charger["charger_id"]] = charger_sessions
+            all_sessions.extend(charger_sessions)
 
     # Optional lightweight forecast: extend sessions into the future based on recent patterns.
     if args.forecast_days > 0:
@@ -630,11 +681,23 @@ def main() -> None:
 
     print("Generating and inserting charger status events...")
     status_count = 0
-    for charger in chargers:
-        events = generate_status_events(
-            charger, sessions_by_charger.get(charger["charger_id"], []), window_start, window_end
-        )
-        status_count += insert_status_events(engine, events)
+    print(f"Generating charger status events using {args.workers} worker(s)...")
+    all_events: List[Dict[str, object]] = []
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(
+                generate_status_events,
+                charger,
+                sessions_by_charger.get(charger["charger_id"], []),
+                window_start,
+                window_end,
+            ): charger
+            for charger in chargers
+        }
+        for future in as_completed(futures):
+            all_events.extend(future.result())
+
+    status_count = insert_status_events(engine, all_events)
 
     print(f"Inserted {status_count} charger status rows")
 
@@ -650,6 +713,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chargers", type=int, default=20, help="How many chargers to seed (default: 20)")
     parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--forecast-days", type=int, default=0, help="Forecast horizon (days) to extend sessions into future")
+    parser.add_argument("--workers", type=int, default=4, help="Number of threads for generation (default: 4)")
     parser.add_argument("--reset", action="store_true", help="Truncate tables before seeding (fresh demo)")
     return parser.parse_args()
 
