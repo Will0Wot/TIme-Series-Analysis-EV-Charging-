@@ -36,10 +36,11 @@ def load_status_overview(window_days: int) -> pd.DataFrame:
         """
         SELECT
             COUNT(*) AS samples,
-            COUNT(DISTINCT charger_id) AS chargers,
-            COUNT(DISTINCT site_id) AS sites
-        FROM charger_status
-        WHERE time >= now() - interval :win
+            COUNT(DISTINCT cs.charger_id) AS chargers,
+            COUNT(DISTINCT c.site_id) AS sites
+        FROM charger_status cs
+        JOIN chargers c ON cs.charger_id = c.charger_id
+        WHERE cs.time >= now() - interval :win
         """
     )
     return pd.read_sql(query, get_engine(), params={"win": f"{window_days} days"})
