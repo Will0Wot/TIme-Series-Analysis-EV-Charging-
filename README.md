@@ -40,6 +40,13 @@ pytest tests/ -m "not integration" -v
 pytest tests/test_db_integration.py -m integration -v
 ```
 
+## Host an always-on demo (Streamlit Cloud + hosted Timescale/Postgres)
+1) Create a managed database: easiest is Timescale Cloud (TimescaleDB enabled by default). Grab the connection string, e.g. `DATABASE_URL=postgresql://...`.
+2) Seed it once from your laptop: `DATABASE_URL=<remote-conn-string> python scripts/generate_ev_data.py --days 30 --sites 10 --chargers 50`.
+3) Push this repo to GitHub. In Streamlit Community Cloud, create a new app pointing to the repo, set the entrypoint to `scripts/streamlit_dashboard.py`, and use `requirements.txt`.
+4) Add secrets in Streamlit: `DATABASE_URL="<remote-conn-string>"` (and optionally `PYTHONPATH="."`).
+5) Deploy and share the Streamlit URL; the app will stay online and read live data from the hosted DB (no need to start anything locally).
+
 ## What you can do with it
 - Demo reliability KPIs (uptime, fault/offline rate, MTBF/MTTR) and active alerts across chargers/sites.
 - Identify offender chargers/models/connectors and lost session minutes (user impact).

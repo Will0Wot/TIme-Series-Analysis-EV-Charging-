@@ -224,11 +224,17 @@ def init_schema(engine) -> None:
     with engine.begin() as conn:
         conn.execute(text(base_sql))
 
-    # Operations that require autocommit (continuous aggregate + policies)
+    # Operations that require autocommit (continuous aggregate + policies).
+    # On postgres without Timescale TSL (e.g., Apache-licensed builds), these will fail;
+    # gracefully skip so base tables still exist.
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text(cagg_sql))
-        for stmt in policy_sql:
-            conn.execute(text(stmt))
+        try:
+            conn.execute(text(cagg_sql))
+            for stmt in policy_sql:
+                conn.execute(text(stmt))
+        except Exception as exc:  # broad by design to handle license/extension errors
+            print(f"Skipping Timescale continuous aggregate/policies: {exc}")
+            conn.rollback()
 
 
 def reset_data(engine) -> None:
