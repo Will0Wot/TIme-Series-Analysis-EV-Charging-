@@ -2,6 +2,8 @@
 
 End-to-end passion project for EV charger reliability: synthetic status pings and sessions into TimescaleDB, FastAPI reliability endpoints, a Streamlit dashboard, and notebooks for deeper analysis.
 
+Use it to spin up a full local stack that streams charger heartbeats and sessions into Timescale, inspect reliability KPIs via the FastAPI endpoints or Streamlit dashboard, and run experiments such as fault-rate sensitivity to load, uptime impacts from simulated outages, anomaly/alert tuning, predictive maintenance baselines (Prophet/XGBoost/LSTM stubs), and capacity planning “what-ifs” across sites and charger models.
+
 ## Quick Start
 ```bash
 # 0) Prereqs: Python 3.13+, Docker (for Timescale)
